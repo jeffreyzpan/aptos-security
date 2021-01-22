@@ -1,0 +1,5 @@
+*.tar
+*.pth
+*.pyc
+checkpoints
+*.tfevents.*
