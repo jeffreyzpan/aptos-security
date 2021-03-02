@@ -9,10 +9,9 @@ import torchvision.utils as utils
 from torch.utils.tensorboard import SummaryWriter
 import lib.models as models
 from lib.utils.utils import *
+from lib.utils.radam import RAdam
 
-from lib.datasets.data_utils import get_data_statistics, generate_dataset
-from lib.adversarial.adversarial import thermometer_encoding
-import  art.defences as defences
+from lib.datasets.data_utils import generate_dataset
 
 import numpy as np
 
@@ -66,12 +65,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, data in enumerate(train_loader):
+    for i, (inputs, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        inputs = data['image']
-        target = data['labels'].view(-1, 1) # convert to (batch_size, 1) shape
 
         if '-1' not in args.gpu_ids:
             inputs = inputs.cuda(non_blocking=True)
@@ -79,11 +75,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute output
         output = model(inputs)
-        loss = criterion(output, target.float())
+        loss = criterion(output, target)
         # measure accuracy and record loss
         acc = accuracy(output, target)
         losses.update(loss.item(), inputs.size(0))
-        top1.update(acc.item(), inputs.size(0))
+        top1.update(acc[0].item(), inputs.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -114,10 +110,7 @@ def validate(val_loader, model, criterion, epoch, args):
 
     with torch.no_grad():
         end = time.time()
-        for i, data in enumerate(val_loader):
-
-            inputs = data['image']
-            target = data['labels'].view(-1, 1)
+        for i, (inputs, target) in enumerate(val_loader):
 
             if '-1' not in args.gpu_ids:
                 inputs = inputs.cuda(non_blocking=True)
@@ -125,12 +118,12 @@ def validate(val_loader, model, criterion, epoch, args):
 
             # compute output
             output = model(inputs)
-            loss = criterion(output, target.float())
+            loss = criterion(output, target)
 
             # measure accuracy and record loss
             acc = accuracy(output, target)
             losses.update(loss.item(), inputs.size(0))
-            top1.update(acc.item(), inputs.size(0))
+            top1.update(acc[0].item(), inputs.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -145,12 +138,6 @@ def validate(val_loader, model, criterion, epoch, args):
 
     summary.add_scalar('test acc1', top1.avg, epoch)
     summary.add_scalar('test loss', losses.avg, epoch)
-
-    # visualize a batch of testing images
-    dataiter = iter(val_loader)
-    images = dataiter.next()['image']
-    img_grid = utils.make_grid(images)
-    summary.add_image("Validation Images", img_grid)
 
     return top1.avg, losses.avg
 
@@ -195,10 +182,11 @@ if __name__ == '__main__':
     # set variables based on dataset to evaluate on
     input_size = 456 if args.input_size == -1 else args.input_size
 
-    criterion = torch.nn.MSELoss()
+    #criterion = torch.nn.MSELoss()
+    criterion = torch.nn.CrossEntropyLoss()
     train_loader, test_loader, _ = generate_dataset(args.data_path, input_size, args.batch_size, args.workers, args.inc_contrast)
 
-    model = models.__dict__[args.arch](num_classes=1)
+    model = models.__dict__[args.arch](num_classes=5)
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -228,13 +216,16 @@ if __name__ == '__main__':
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(model.parameters(), args.learning_rate,
                     weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min',patience=5,factor=0.5,verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min',patience=4,factor=0.5,verbose=True)
     elif args.optimizer == 'rmsprop':
         optimizer = torch.optim.RMSprop(model.parameters(), args.learning_rate, momentum=args.momentum,
                     weight_decay=args.weight_decay)
     elif args.optimizer == 'sgd':
        optimizer = torch.optim.SGD(model.parameters(), args.learning_rate, momentum=args.momentum,
                     weight_decay=args.weight_decay, nesterov=True)
+    elif args.optimizer == 'radam':
+        optimizer = RAdam(model.parameters(), args.learning_rate,
+                    weight_decay=args.weight_decay)
 
     if -1 not in gpu_id_list and torch.cuda.is_available():
         model.cuda()

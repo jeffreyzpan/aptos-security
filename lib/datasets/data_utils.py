@@ -93,62 +93,94 @@ def preprocess_image(image, sigmaX=10):
     image = cv2.addWeighted (image,4, cv2.GaussianBlur(image, (0,0) ,sigmaX), -4, 128)
     return image
 
+class APTOSTensorDataset(data.Dataset):
+    def __init__(self, tensors, transform=None):
+        assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors)
+        self.tensors = tensors
+        self.transform = transforms.Compose([transforms.ToPILImage(), transform, transforms.ToTensor()])
+
+    def __getitem__(self, index):
+        x = self.tensors[0][index]
+        if self.transform:
+            x = self.transform(x)
+        y = self.tensors[1][index]
+        return x, y
+
+    def change_contrast(self, new_contrast):
+        self.transform = transforms.Compose([transforms.ToPILImage(), AdjustContrast(new_contrast), transforms.ToTensor()])
+
+    def __len__(self):
+        return self.tensors[0].size(0)
+
 class APTOSDataset(data.Dataset):
-    def __init__(self, csv_path, img_path, transform):
-        self.labels = pd.read_csv(csv_path)
+    def __init__(self, csv_path, img_path, transform, contrast=1):
+        self.labels = pd.read_csv(csv_path, header=None)
+        self.targets = self.labels.loc[:,self.labels.columns[-1]]
+        '''
+        targets = raw_targets.copy()
+        for target in targets:
+            one_hot = torch.zeros(5)
+            one_hot[target] = 1
+            target = one_hot.long()
+        '''
         self.img_path = img_path
+        self.change_contrast = AdjustContrast(contrast)
         self.transform = transform
 
     def __len__(self):
         return len(self.labels)
+
+    def change_contrast(self, new_contrast):
+        self.change_contrast = AdjustContrast(new_contrast)
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
         img_name = os.path.join(self.img_path, self.labels.loc[idx][0]+'.png')
         image = Image.open(img_name, 'r')
-        label = self.labels.loc[idx][1]
+        #label = torch.zeros(5).long()
+        #label = self.labels.loc[idx][1]
+        label = self.targets[idx]
 
         if self.transform:
+            image = self.change_contrast(image)
             image = self.transform(image)
 
-        return {'image': image, 'labels': label}
+        return (image, label)
 
 def generate_dataset(path, input_size, batch_size, num_workers, inc_contrast=1, **kwargs):
 
     print('generating APTOS dataset ===>')
-    train_label_path = os.path.join(path, 'train.csv')
+    train_label_path = os.path.join(path, 'train_new.csv')
 
-    test_label_path = os.path.join(path, 'sample_submission.csv')
+    test_label_path = os.path.join(path, 'val.csv')
     train_path = os.path.join(path, 'train_images')
-    test_path = os.path.join(path, 'test_images')
+    test_path = os.path.join(path, 'val_images')
 
     assert os.path.exists(train_path), train_path + ' not found'
     assert os.path.exists(test_path), test_path + ' not found'
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                     std=[0.229, 0.224, 0.225])
 
-    train_transform_list = [AdjustContrast(inc_contrast),
-            transforms.RandomResizedCrop(input_size),
+    train_transform_list = [transforms.RandomResizedCrop(input_size),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize]
 
-    test_transform_list = [AdjustContrast(inc_contrast),
-            transforms.Resize(int(input_size / 0.875)),
+    test_transform_list = [transforms.Resize(int(input_size / 0.875)),
             transforms.CenterCrop(input_size),
             transforms.ToTensor(),
             normalize]
 
     train_loader = data.DataLoader(
             APTOSDataset(
-                train_label_path, train_path, transforms.Compose(train_transform_list)),
+                train_label_path, train_path, transforms.Compose(train_transform_list), inc_contrast),
             batch_size=batch_size, shuffle=True,
             num_workers=num_workers, pin_memory=True)
 
     val_loader = data.DataLoader(
             APTOSDataset(
-                test_label_path, test_path, transforms.Compose(test_transform_list)),
+                test_label_path, test_path, transforms.Compose(test_transform_list), inc_contrast),
             batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=True)
 

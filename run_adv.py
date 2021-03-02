@@ -15,8 +15,8 @@ import torchvision.utils as utils
 from torch.utils.tensorboard import SummaryWriter
 import lib.models as models
 from lib.utils.utils import *
-from lib.utils.quantize_utils import quantize_model, kmeans_update_model, QConv2d, QLinear, calibrate
-from lib.datasets.data_utils import get_data_statistics, generate_dataset
+from lib.utils.radam import RAdam
+from lib.datasets.data_utils import generate_dataset
 from lib.adversarial.adversarial import *
 from lib.adversarial.tvm import TotalVarMin
 
@@ -50,7 +50,7 @@ parser.add_argument('--epochs', type=int, default=100,
                     help='number of epochs to perform adversarial training for')
 parser.add_argument('--optimizer', type=str,
                     default='sgd', help='optimizer to use')
-parser.add_argument('--batch_size', type=int, default=128, help='batch size')
+parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--learning_rate', type=float,
                     default=0.1, help='learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
@@ -80,8 +80,6 @@ parser.add_argument('--defences', type=str, nargs='+', default=[], help='list of
 parser.add_argument('--input_size', type=int, default=-1,
                     help='input size for adv training; use -1 to use default input size')
 parser.add_argument('--inc_contrast', type=float, default=1, help='factor to increase the dataset contrast')
-parser.add_argument('--linear_quantization', dest='linear_quantization', action='store_true',
-                    help='quantize both weights and activations')
 
 global best_acc1, best_loss
 
@@ -93,10 +91,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    top2 = AverageMeter('Acc@2', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses, top1, top2],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -115,10 +113,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         output = model(inputs)
         loss = criterion(output, target)
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, acc2 = accuracy(output, target, topk=(1, 2))
         losses.update(loss.item(), inputs.size(0))
         top1.update(acc1[0], inputs.size(0))
-        top5.update(acc5[0], inputs.size(0))
+        top2.update(acc2[0], inputs.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -132,7 +130,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if i % args.print_freq == 0:
             progress.display(i)
 
-    summary.add_scalar('train acc5', top5.avg, epoch)
+    summary.add_scalar('train acc2', top2.avg, epoch)
     summary.add_scalar('train acc1', top1.avg, epoch)
     summary.add_scalar('train loss', losses.avg, epoch)
 
@@ -141,10 +139,10 @@ def validate(val_loader, model, criterion, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    top2 = AverageMeter('Acc@2', ':6.2f')
     progress = ProgressMeter(
         len(val_loader),
-        [batch_time, losses, top1, top5],
+        [batch_time, losses, top1, top2],
         prefix="Test: ")
 
     # switch to evaluate mode
@@ -162,10 +160,10 @@ def validate(val_loader, model, criterion, epoch, args):
             loss = criterion(output, target)
 
             # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            acc1, acc2 = accuracy(output, target, topk=(1, 2))
             losses.update(loss.item(), inputs.size(0))
             top1.update(acc1[0], inputs.size(0))
-            top5.update(acc5[0], inputs.size(0))
+            top2.update(acc2[0], inputs.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -178,15 +176,9 @@ def validate(val_loader, model, criterion, epoch, args):
         print(' * Acc@1 {top1.avg:.3f}'
              .format(top1=top1))
 
-    summary.add_scalar('test acc5', top5.avg, epoch)
+    summary.add_scalar('test acc2', top2.avg, epoch)
     summary.add_scalar('test acc1', top1.avg, epoch)
     summary.add_scalar('test loss', losses.avg, epoch)
-
-    # visualize a batch of testing images
-    dataiter = iter(val_loader)
-    images, _ = dataiter.next()
-    img_grid = utils.make_grid(images)
-    summary.add_image("Validation Images", img_grid)
 
     return top1.avg, losses.avg
 
@@ -211,9 +203,6 @@ if __name__ == '__main__':
     best_acc1 = 0
     best_loss = np.iinfo(np.int16).max
 
-    # set gpus ids to use
-    #os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
-
     # check that CUDA is actually available and pass in GPU ids, use CPU if not
     if torch.cuda.is_available():
         gpu_id_list = [int(i.strip()) for i in args.gpu_ids.split(',')]
@@ -235,47 +224,12 @@ if __name__ == '__main__':
         args.arch)
 
     # set variables based on dataset to evaluate on
-    if args.dataset == 'imagenet':
-        input_size = 224 if args.input_size == -1 else args.input_size
-    elif args.dataset == 'cifar10' or args.dataset == 'cifar100':
-        input_size = 32 if args.input_size == -1 else args.input_size
-    elif args.dataset == 'mnist' or args.dataset == 'fmnist':
-        input_size = 28 if args.input_size == -1 else args.input_size
+    input_size = 456 if args.input_size == -1 else args.input_size
 
     criterion = torch.nn.CrossEntropyLoss()
-    train_loader, test_loader, num_classes = generate_dataset(
-        args.dataset, args.data_path, input_size, args.batch_size, args.workers, args.inc_contrast)
-
-    mean, std = get_data_statistics(train_loader)
+    train_loader, test_loader, num_classes = generate_dataset(args.data_path, input_size, args.batch_size, args.workers, args.inc_contrast)
 
     model = models.__dict__[args.arch](num_classes=num_classes)
-
-    if args.linear_quantization:
-        quantizable_idx = []
-        for i, m in enumerate(model.modules()):
-            if type(m) in [QConv2d, QLinear]:
-                quantizable_idx.append(i)
-        # print(model)
-        print(quantizable_idx)
-
-        if 'mobilenetv2' in args.arch:
-            if args.dataset == 'imagenet':
-                strategy = [[8, -1], [7, 7], [5, 6], [4, 6], [5, 6], [5, 7], [5, 6], [7, 4], [4, 6], [4, 6], [7, 7], [5, 6], [4, 6], [7, 3], [5, 7], [4, 7], [7, 3], [5, 7], [4, 7], [7, 7], [4, 7], [4, 7], [6, 4], [6, 7], [4, 7], [7, 4], [6, 7], [5, 7], [7, 4], [6, 7], [5, 7], [7, 4], [6, 7], [6, 7], [6, 4], [5, 7], [6, 7], [6, 4], [5, 7], [6, 7], [7, 7], [4, 7], [7, 7], [7, 7], [4, 7], [7, 7], [7, 7], [4, 7], [7, 7], [7, 7], [4, 7], [7, 7], [8, 8]]
-            else:
-                strategy =  [[8, -1], [6, 6], [3, 6], [3, 6], [6, 6], [4, 6], [3, 6], [6, 6], [4, 6], [4, 6], [6, 4], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [6, 6], [5, 5], [5, 5], [3, 5], [4, 5], [5, 5], [3, 5], [5, 5], [5, 5], [3, 5], [5, 5], [5, 5], [3, 5], [4, 5], [5, 5], [2, 5], [5, 5], [5, 5], [2, 5], [5, 5], [5, 5], [2, 5], [5, 5], [2, 4], [2, 5], [5, 5], [2, 4], [2, 5], [5, 5], [2, 4], [2, 5], [5, 5], [8, 8]]
-        else:
-            raise NotImplementedError
-
-        print(strategy)
-        quantize_layer_bit_dict = {n: b for n, b in zip(quantizable_idx, strategy)}
-        for i, layer in enumerate(model.modules()):
-            if i not in quantizable_idx:
-                continue
-            else:
-                layer.w_bit = quantize_layer_bit_dict[i][0]
-                layer.a_bit = quantize_layer_bit_dict[i][1]
-        model = model.cuda()
-        model = calibrate(model, train_loader)
 
     assert os.path.isfile(
         args.resume), 'Adversarial benchmarking requires a pretrained model — use train_models.py to train a model'
@@ -309,16 +263,17 @@ if __name__ == '__main__':
     elif args.optimizer == 'sgd':
        optimizer = torch.optim.SGD(model.parameters(), args.learning_rate, momentum=args.momentum,
                     weight_decay=args.weight_decay, nesterov=True)
+    elif args.optimizer == 'radam':
+        optimizer = RAdam(model.parameters(), args.learning_rate,
+                    weight_decay=args.weight_decay)
 
     if -1 not in gpu_id_list:
         model.to(f'cuda:{args.gpu_ids}')
         criterion.to(f'cuda:{args.gpu_ids}')
 
     cudnn.benchmark = True
-    if args.dataset in ['fmnist', 'mnist']:
-        input_shape = (1, input_size, input_size)
-    else:
-        input_shape = (3, input_size, input_size)
+
+    input_shape = (3, input_size, input_size)
 
     # get initial validation set accuracy
 
@@ -332,9 +287,6 @@ if __name__ == '__main__':
     # initialize attacks and append to dict
 
     classifier = fb.PyTorchModel(copy.deepcopy(model).eval(), (0, 1))
-
-    with open('parameters/{}_parameters.json'.format(args.dataset)) as f:
-        parameter_list = json.load(f)
     epsilons = args.epsilons
 
     #white box attacks
@@ -352,37 +304,7 @@ if __name__ == '__main__':
     if 'bim' in args.attacks:
         attack_list['bim'] = fb.attacks.LinfBasicIterativeAttack()
 
-    #black box attacks
-
-    if 'boundary' in args.attacks:
-        attack_list['boundary'] = fb.attacks.BoundaryAttack()
-    if 'saltandpepper' in args.attacks:
-        attack_list['saltandpepper'] = fb.attacks.SaltAndPepperNoiseAttack()
-    if 'gaussian' in args.attacks:
-        attack_list['gaussian'] = fb.attacks.L2RepeatedAdditiveGaussianNoiseAttack()
-    if 'uniform' in args.attacks:
-        attack_list['uniform'] = fb.attacks.L2RepeatedAdditiveUniformNoiseAttack()
-
     # initialize defences and append to dict
-
-    if 'pixeldefend' in args.defences:
-
-        pixel_cnn = models.__dict__['pixel_cnn'](input_channels=input_shape[0])
-        assert os.path.isfile('./pixel_models/{}/model_best.pth.tar'.format(args.dataset)), 'PixelDefend requires a pretrained PixelCNN++, please add the checkpoint in the appropriate folder'
-        print("=> loading checkpoint './pixel_models/{}/model_best.pth.tar'".format(args.dataset))
-
-        checkpoint = torch.load('./pixel_models/{}/model_best.pth.tar'.format(args.dataset))
-        checkpoint = {n.replace('module.', ''): v for n, v in checkpoint.items()}
-        pixel_cnn.load_state_dict(checkpoint)
-        print("loaded PixelCNN++")
-
-        if -1 not in gpu_id_list:
-            pixel_cnn = torch.nn.DataParallel(pixel_cnn, device_ids=gpu_id_list).cuda()
-        pixel_cnn = PyTorchClassifier(pixel_cnn, loss=criterion, optimizer=optimizer, input_shape=input_shape, nb_classes=num_classes)
-
-        pixel_params = parameter_list['pixeldefend']
-        defence_list['pixeldefend'] = defences.PixelDefend(clip_values=(
-            pixel_params['clip_min'], pixel_params['clip_max']), eps=pixel_params['eps'], pixel_cnn=pixel_cnn)
 
     if 'tvm' in args.defences:
         tvm_params = parameter_list['tvm']
@@ -392,67 +314,13 @@ if __name__ == '__main__':
         jpeg_params = parameter_list['jpeg']
         defence_list['jpeg'] = defences.JpegCompression(clip_values=(
             jpeg_params['clip_min'], jpeg_params['clip_max']), channel_index=jpeg_params['channel_index'], quality=jpeg_params['quality'])
-    if 'adv_retraining' in args.defences:
-        print("performing adversarial retraining using Madry's method")
-        if args.pretrained_adv:
-            robust_model = copy.deepcopy(model)
-            assert os.path.isfile(os.path.join(args.save_path, 'adv_trained_model/checkpoint.pth.tar')), 'no adversarially-trained model found!'
-            print('=> loading adversarially-trained model')
 
-            checkpoint = torch.load(os.path.join(args.save_path, 'adv_trained_model/checkpoint.pth.tar'))
-            model.load_state_dict(checkpoint['state_dict'])
-        else:
-            pgd_attack = {'madry_pgd': fb.attacks.PGD()}
-            adv_train_loader = gen_attacks(train_loader, classifier, pgd_attack, [8/255])['madry_pgd'][0]
-            adv_test_loader = gen_attacks(test_loader, classifier, pgd_attack, [8/255])['madry_pgd'][0]
-            robust_model = copy.deepcopy(model)
-
-            # define optimizer and set optimizer hyperparameters
-
-            if args.optimizer == 'adam':
-                robust_optimizer = torch.optim.Adam(robust_model.parameters(), args.learning_rate,
-                        weight_decay=args.weight_decay)
-                robust_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        robust_optimizer, 'min', patience=5, factor=0.5, verbose=True)
-            elif args.optimizer == 'rmsprop':
-                robust_optimizer = torch.optim.RMSprop(robust_model.parameters(), args.learning_rate, momentum=args.momentum,
-                            weight_decay=args.weight_decay)
-            elif args.optimizer == 'sgd':
-                robust_optimizer = torch.optim.SGD(robust_model.parameters(), args.learning_rate, momentum=args.momentum,
-                            weight_decay=args.weight_decay, nesterov=True)
-
-            top1 = 0
-            for epoch in range(args.epochs):
-                train(adv_train_loader, robust_model,
-                      criterion, robust_optimizer, epoch, args)
-                acc1, val_loss = validate(
-                      adv_test_loader, robust_model, criterion, epoch, args)
-                if args.optimizer == 'adam':
-                    robust_scheduler.step(np.around(val_loss, 2))
-
-                # remember best acc@1 and save checkpoint
-                top1 = max(top1, acc1)
-                is_best = acc1 > top1
-                save_checkpoint({
-                            'epoch': epoch + 1,
-                            'arch': args.arch,
-                            'state_dict': robust_model.state_dict(),
-                            'best_acc1': best_acc1,
-                            'optimizer' : optimizer.state_dict(),
-                        }, is_best, os.path.join(args.save_path, 'adv_trained_model'))
-
-
-    #initial_acc, _ = validate(test_loader, model, criterion, 1, args)
-    #import pdb
-    #pdb.set_trace()
+    initial_acc, _ = validate(test_loader, model, criterion, 1, args)
+    print("Initial Model Accuracy ===> {}".format(initial_acc))
 
     #convert dataloader into an eagerPy tensor for FoolBox attack generation
     adv_dict = gen_attacks(test_loader,
                            classifier, attack_list, epsilons, args.gpu_ids)
-
-    #append cw attack if evaluated
-    if 'carliniLinf' in args.attacks:
-        adv_dict.update(cw_dict)
 
     # loop through all generated dataloaders with adversarial images
     results_dict = {}
@@ -477,12 +345,6 @@ if __name__ == '__main__':
             accuracies = {'initial': initial_acc.item(
             ), 'attacked': attacked_acc.item()}
 
-            if 'adv_retraining' in args.defences:
-                # evaluate retrained model
-                acc1, val_loss = validate(
-                    epsilon_attack, robust_model, criterion, epoch, args)
-                accuracies['adv_training'] = acc1.item()
-
             for def_name in def_adv_dict:
                 print("Testing performance of defence {}: ".format(def_name))
                 top1, _ = validate(def_adv_dict[def_name], model, criterion, 1, args)
@@ -490,12 +352,6 @@ if __name__ == '__main__':
                 def_images = torch.cat(def_images).numpy()
 
                 accuracies[def_name] = top1.item()
-
-                # save def images for visualization purposes
-                dataiter = iter(def_adv_dict[def_name])
-                images, _ = dataiter.next()
-                img_grid = utils.make_grid(images)
-                summary.add_image("Defense {} against Attack {} with eps {}".format(def_name, attack_name, epsilon), img_grid)
 
             results_dict[attack_name + ' eps {}'.format(epsilon)] = accuracies
         print(results_dict)
